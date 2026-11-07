@@ -1,0 +1,567 @@
+import smtplib
+import os
+import json
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.header import Header
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+# ======== НАСТРОЙКИ ========
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "9249569036:AAF5cPOc-pQLcgc_BiAwDVGaRYSOgqTskC4")
+MY_EMAIL     = "hizory4@gmail.com"
+APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "apqjhbqjnxojtgnz")
+TARGET_EMAIL = "support@max.ru"
+OWNER_ID     = 1925084785
+SUBS_FILE    = "subscriptions.json"
+
+# ======== ТАРИФЫ ========
+PLANS = {
+    "day":     {"label": "1 день — 1$",      "days": 1},
+    "week":    {"label": "7 дней — 350₽",    "days": 7},
+    "month":   {"label": "1 месяц — 500₽",   "days": 30},
+    "forever": {"label": "Навсегда — 1200₽", "days": -1},
+}
+
+PAYMENT_INFO = (
+    "💳 *Способы оплаты:*\n"
+    "• USDT (TRC20): `TKxxxxxxxxxxxxxxxxxxxxxxxxxxx`\n"
+    "• Карта РФ: `2200 0000 0000 0000`\n\n"
+    "После оплаты напишите владельцу с чеком и вашим Telegram ID."
+)
+
+# ======== СОСТОЯНИЯ — основной бот ========
+CHOOSE_REASON, ENTER_LINK, CONFIRM = range(3)
+
+# ======== СОСТОЯНИЯ — админ-панель ========
+(
+    ADMIN_MENU,
+    ADMIN_GIVE_WAIT_ID,
+    ADMIN_GIVE_WAIT_PLAN,
+    ADMIN_REVOKE_WAIT_ID,
+) = range(10, 14)
+
+# ======== ШАБЛОНЫ ПРИЧИН ========
+REASONS = {
+    "porn": {
+        "title": "🔞 Порнографический контент",
+        "template": (
+            "Здравствуйте!\n\n"
+            "Сообщаю о канале, который распространяет порнографический контент, "
+            "нарушая правила платформы и законодательство РФ.\n\n"
+            "Ссылка на канал: {link}\n\n"
+            "Прошу рассмотреть обращение и принять меры (удаление контента "
+            "и/или блокировку канала).\n\n"
+            "При необходимости могу предоставить дополнительные доказательства.\n\n"
+            "С уважением."
+        ),
+    },
+    "drugs": {
+        "title": "💊 Распространение наркотиков",
+        "template": (
+            "Здравствуйте!\n\n"
+            "Сообщаю о канале, через который предположительно ведётся продажа "
+            "или реклама запрещённых веществ (наркотиков), что является "
+            "уголовно наказуемым деянием.\n\n"
+            "Ссылка на канал: {link}\n\n"
+            "Прошу незамедлительно проверить канал и принять меры в соответствии "
+            "с правилами платформы и законодательством РФ.\n\n"
+            "С уважением."
+        ),
+    },
+    "data": {
+        "title": "📋 Утечка персональных данных",
+        "template": (
+            "Здравствуйте!\n\n"
+            "Сообщаю о канале, на котором публикуются персональные данные людей "
+            "(ФИО, телефоны, адреса, документы и т.п.) без их согласия, "
+            "что нарушает Федеральный закон № 152-ФЗ «О персональных данных».\n\n"
+            "Ссылка на канал: {link}\n\n"
+            "Прошу рассмотреть обращение и принять меры по удалению контента "
+            "и блокировке канала.\n\n"
+            "С уважением."
+        ),
+    },
+}
+
+BANNER = (
+    "🔥 *HIZORYMAX*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "📨 Бот для жалоб в поддержку *Макс*\n"
+    "━━━━━━━━━━━━━━━━━━━━"
+)
+
+ADMIN_BANNER = (
+    "⚙️ *АДМИН-ПАНЕЛЬ*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "👑 Добро пожаловать, владелец!\n"
+    "━━━━━━━━━━━━━━━━━━━━"
+)
+
+
+# ======== ПОДПИСКИ ========
+
+def load_subs() -> dict:
+    if os.path.exists(SUBS_FILE):
+        with open(SUBS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_subs(subs: dict):
+    with open(SUBS_FILE, "w") as f:
+        json.dump(subs, f, indent=2)
+
+def has_active_sub(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    subs = load_subs()
+    entry = subs.get(str(user_id))
+    if not entry:
+        return False
+    if entry["until"] == "forever":
+        return True
+    return datetime.now() < datetime.fromisoformat(entry["until"])
+
+def grant_sub(user_id: int, plan_key: str):
+    subs = load_subs()
+    plan = PLANS[plan_key]
+    until = "forever" if plan["days"] == -1 else (
+        datetime.now() + timedelta(days=plan["days"])
+    ).isoformat()
+    subs[str(user_id)] = {"plan": plan_key, "until": until}
+    save_subs(subs)
+
+def revoke_sub(user_id: int):
+    subs = load_subs()
+    subs.pop(str(user_id), None)
+    save_subs(subs)
+
+def sub_info(user_id: int) -> str:
+    if user_id == OWNER_ID:
+        return "👑 Владелец — доступ навсегда"
+    subs = load_subs()
+    entry = subs.get(str(user_id))
+    if not entry:
+        return "❌ Подписки нет"
+    if entry["until"] == "forever":
+        return f"✅ Активна · тариф: {PLANS[entry['plan']]['label']} · навсегда"
+    until = datetime.fromisoformat(entry["until"])
+    if datetime.now() >= until:
+        return "⏰ Подписка истекла"
+    left  = until - datetime.now()
+    days  = left.days
+    hours = left.seconds // 3600
+    return f"✅ Активна · осталось {days}д {hours}ч · тариф: {PLANS[entry['plan']]['label']}"
+
+def subs_count() -> int:
+    subs = load_subs()
+    count = 0
+    for entry in subs.values():
+        if entry["until"] == "forever" or datetime.now() < datetime.fromisoformat(entry["until"]):
+            count += 1
+    return count
+
+
+# ======== КЛАВИАТУРЫ ========
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Выдать подписку",   callback_data="adm_give")],
+        [InlineKeyboardButton("❌ Забрать подписку",  callback_data="adm_revoke")],
+        [InlineKeyboardButton("👥 Список подписчиков", callback_data="adm_users")],
+        [InlineKeyboardButton("🔍 Проверить пользователя", callback_data="adm_check")],
+        [InlineKeyboardButton("🚪 Закрыть панель",    callback_data="adm_close")],
+    ])
+
+def plan_keyboard(prefix="adm_plan_"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(PLANS["day"]["label"],     callback_data=f"{prefix}day")],
+        [InlineKeyboardButton(PLANS["week"]["label"],    callback_data=f"{prefix}week")],
+        [InlineKeyboardButton(PLANS["month"]["label"],   callback_data=f"{prefix}month")],
+        [InlineKeyboardButton(PLANS["forever"]["label"], callback_data=f"{prefix}forever")],
+        [InlineKeyboardButton("◀️ Назад",               callback_data="adm_back")],
+    ])
+
+
+# ======== ХЭНДЛЕРЫ — ГЛАВНОЕ МЕНЮ ========
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if has_active_sub(user_id):
+        keyboard = [
+            [InlineKeyboardButton(REASONS["porn"]["title"],  callback_data="porn")],
+            [InlineKeyboardButton(REASONS["drugs"]["title"], callback_data="drugs")],
+            [InlineKeyboardButton(REASONS["data"]["title"],  callback_data="data")],
+        ]
+        await update.message.reply_text(
+            f"{BANNER}\n\n🟢 {sub_info(user_id)}\n\nВыберите *причину жалобы*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return CHOOSE_REASON
+    else:
+        keyboard = [
+            [InlineKeyboardButton(PLANS["day"]["label"],     callback_data="buy_day")],
+            [InlineKeyboardButton(PLANS["week"]["label"],    callback_data="buy_week")],
+            [InlineKeyboardButton(PLANS["month"]["label"],   callback_data="buy_month")],
+            [InlineKeyboardButton(PLANS["forever"]["label"], callback_data="buy_forever")],
+        ]
+        await update.message.reply_text(
+            f"{BANNER}\n\n🔒 *Для использования бота необходима подписка*\n\nВыберите тариф:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return ConversationHandler.END
+
+
+async def buy_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    plan_key = query.data.replace("buy_", "")
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+    user_id = update.effective_user.id
+    await query.edit_message_text(
+        f"💰 *Вы выбрали:* {plan['label']}\n\n"
+        f"🆔 Ваш Telegram ID: `{user_id}`\n\n"
+        f"{PAYMENT_INFO}\n\n"
+        "После подтверждения оплаты владелец выдаст вам доступ.",
+        parse_mode="Markdown",
+    )
+
+
+# ======== ХЭНДЛЕРЫ — ЖАЛОБА ========
+
+async def choose_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    reason_key = query.data
+    context.user_data["reason_key"]   = reason_key
+    context.user_data["reason_title"] = REASONS[reason_key]["title"]
+    await query.edit_message_text(
+        f"✅ Причина: *{REASONS[reason_key]['title']}*\n\n"
+        "Введите *ссылку на канал*, где зафиксировано нарушение:",
+        parse_mode="Markdown",
+    )
+    return ENTER_LINK
+
+
+async def enter_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_active_sub(update.effective_user.id):
+        await update.message.reply_text("🔒 Подписка истекла. Нажми /start для продления.")
+        return ConversationHandler.END
+    link = update.message.text.strip()
+    if not link:
+        await update.message.reply_text("⚠️ Ссылка не может быть пустой. Попробуйте ещё раз:")
+        return ENTER_LINK
+    context.user_data["link"] = link
+    body = REASONS[context.user_data["reason_key"]]["template"].format(link=link)
+    context.user_data["body"] = body
+    keyboard = [[
+        InlineKeyboardButton("✅ Отправить", callback_data="send"),
+        InlineKeyboardButton("❌ Отмена",    callback_data="cancel"),
+    ]]
+    await update.message.reply_text(
+        f"📋 *Предпросмотр письма:*\n\n`{body}`\n\n"
+        f"📧 Будет отправлено на: `{TARGET_EMAIL}`\n\nПодтвердите отправку:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return CONFIRM
+
+
+async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Отправка отменена. Нажми /start чтобы начать заново.")
+        return ConversationHandler.END
+    await query.edit_message_text("⏳ Отправляю письмо...")
+    success, error_text = send_email(context.user_data["reason_title"], context.user_data["body"])
+    if success:
+        await query.edit_message_text(
+            f"✅ *Жалоба успешно отправлена!*\n\n"
+            f"📨 С: `{MY_EMAIL}`\n📩 На: `{TARGET_EMAIL}`\n"
+            f"📌 Причина: {context.user_data['reason_title']}\n\n"
+            "Нажми /start чтобы отправить ещё одну жалобу.",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ *Ошибка отправки:*\n`{error_text}`\n\nПопробуйте снова (/start).",
+            parse_mode="Markdown",
+        )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено. Нажми /start чтобы начать заново.")
+    return ConversationHandler.END
+
+
+# ======== ХЭНДЛЕРЫ — АДМИН-ПАНЕЛЬ ========
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"{ADMIN_BANNER}\n\n"
+        f"👥 Активных подписок: *{subs_count()}*\n\n"
+        "Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ADMIN_MENU
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # ── Выдать подписку ──
+    if data == "adm_give":
+        await query.edit_message_text(
+            "✅ *Выдать подписку*\n\nВведите *Telegram ID* пользователя:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_GIVE_WAIT_ID
+
+    # ── Забрать подписку ──
+    elif data == "adm_revoke":
+        await query.edit_message_text(
+            "❌ *Забрать подписку*\n\nВведите *Telegram ID* пользователя:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_REVOKE_WAIT_ID
+
+    # ── Список подписчиков ──
+    elif data == "adm_users":
+        subs = load_subs()
+        if not subs:
+            text = "📭 *Подписчиков пока нет.*"
+        else:
+            lines = ["👥 *Список подписчиков:*\n"]
+            for uid, entry in subs.items():
+                plan_label = PLANS.get(entry["plan"], {}).get("label", entry["plan"])
+                until = "навсегда" if entry["until"] == "forever" else entry["until"][:10]
+                status = "✅" if has_active_sub(int(uid)) else "⏰"
+                lines.append(f"{status} `{uid}` — {plan_label} · до {until}")
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_MENU
+
+    # ── Проверить пользователя ──
+    elif data == "adm_check":
+        await query.edit_message_text(
+            "🔍 *Проверить пользователя*\n\nВведите *Telegram ID*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        context.user_data["adm_action"] = "check"
+        return ADMIN_GIVE_WAIT_ID
+
+    # ── Назад ──
+    elif data == "adm_back":
+        await query.edit_message_text(
+            f"{ADMIN_BANNER}\n\n"
+            f"👥 Активных подписок: *{subs_count()}*\n\n"
+            "Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(),
+        )
+        context.user_data.pop("adm_action", None)
+        return ADMIN_MENU
+
+    # ── Закрыть ──
+    elif data == "adm_close":
+        await query.edit_message_text("🚪 Панель закрыта.")
+        return ConversationHandler.END
+
+    return ADMIN_MENU
+
+
+async def admin_give_wait_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        uid = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Некорректный ID. Введите числовой Telegram ID:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_GIVE_WAIT_ID
+
+    # Если это была проверка
+    if context.user_data.get("adm_action") == "check":
+        context.user_data.pop("adm_action", None)
+        await update.message.reply_text(
+            f"🔍 *Информация о пользователе* `{uid}`:\n\n{sub_info(uid)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад в меню", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_MENU
+
+    context.user_data["adm_target_id"] = uid
+    await update.message.reply_text(
+        f"👤 Пользователь: `{uid}`\n\nВыберите тариф подписки:",
+        parse_mode="Markdown",
+        reply_markup=plan_keyboard(),
+    )
+    return ADMIN_GIVE_WAIT_PLAN
+
+
+async def admin_give_wait_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "adm_back":
+        await query.edit_message_text(
+            f"{ADMIN_BANNER}\n\n"
+            f"👥 Активных подписок: *{subs_count()}*\n\n"
+            "Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(),
+        )
+        return ADMIN_MENU
+
+    plan_key = query.data.replace("adm_plan_", "")
+    uid = context.user_data.get("adm_target_id")
+
+    if plan_key not in PLANS or not uid:
+        await query.edit_message_text("❌ Ошибка. Попробуйте снова (/admin).")
+        return ConversationHandler.END
+
+    grant_sub(uid, plan_key)
+    await query.edit_message_text(
+        f"✅ *Подписка выдана!*\n\n"
+        f"👤 Пользователь: `{uid}`\n"
+        f"📦 Тариф: *{PLANS[plan_key]['label']}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Назад в меню", callback_data="adm_back")
+        ]]),
+    )
+    return ADMIN_MENU
+
+
+async def admin_revoke_wait_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        uid = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Некорректный ID. Введите числовой Telegram ID:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="adm_back")
+            ]]),
+        )
+        return ADMIN_REVOKE_WAIT_ID
+
+    revoke_sub(uid)
+    await update.message.reply_text(
+        f"✅ *Подписка удалена!*\n\n👤 Пользователь: `{uid}`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Назад в меню", callback_data="adm_back")
+        ]]),
+    )
+    return ADMIN_MENU
+
+
+# ======== ОТПРАВКА EMAIL ========
+
+def send_email(reason_title: str, body: str):
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(f"Жалоба: {reason_title}", "utf-8")
+        msg["From"]    = MY_EMAIL
+        msg["To"]      = TARGET_EMAIL
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(MY_EMAIL, APP_PASSWORD)
+        server.sendmail(MY_EMAIL, [TARGET_EMAIL], msg.as_string())
+        server.quit()
+        return True, None
+    except smtplib.SMTPAuthenticationError:
+        return False, "Ошибка авторизации Gmail. Проверьте app password."
+    except Exception as e:
+        return False, str(e)
+
+
+# ======== ЗАПУСК ========
+
+def main():
+    print("🤖 HIZORYMAX бот запущен...")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Основной диалог
+    main_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CHOOSE_REASON: [CallbackQueryHandler(choose_reason, pattern="^(porn|drugs|data)$")],
+            ENTER_LINK:    [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_link)],
+            CONFIRM:       [CallbackQueryHandler(confirm_send, pattern="^(send|cancel)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # Админ-панель
+    admin_conv = ConversationHandler(
+        entry_points=[CommandHandler("admin", admin_panel)],
+        states={
+            ADMIN_MENU: [
+                CallbackQueryHandler(admin_callback, pattern="^adm_"),
+            ],
+            ADMIN_GIVE_WAIT_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_give_wait_id),
+                CallbackQueryHandler(admin_callback, pattern="^adm_back$"),
+            ],
+            ADMIN_GIVE_WAIT_PLAN: [
+                CallbackQueryHandler(admin_give_wait_plan, pattern="^(adm_plan_|adm_back)"),
+            ],
+            ADMIN_REVOKE_WAIT_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_revoke_wait_id),
+                CallbackQueryHandler(admin_callback, pattern="^adm_back$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(main_conv)
+    app.add_handler(admin_conv)
+    app.add_handler(CallbackQueryHandler(buy_plan, pattern="^buy_"))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
